@@ -69,12 +69,11 @@ namespace cuZFP
                                    unsigned long long &offset0,     // Offset in bits of the first bitstream of the block
                                    const unsigned long long offset, // Offset in bits for this stream
                                    const int &length_bits,          // length of this stream
-                                   const int &add_padding,          // padding at the end of the block, in bits
+                                   const int &total_length_bits,    // total length for the block, in bits
                                    const int &tid,                  // global thread index inside the thread block
                                    uint *sm_in,                     // shared memory containing the compressed input data
                                    uint *sm_out,                    // shared memory to stage the compacted compressed data
                                    uint maxpad32,                   // Leading dimension of the shared memory (padded maxbits)
-                                   uint *sm_length,                 // shared memory to compute a prefix-sum inside the block
                                    uint *output)                    // output pointer
     {
         // All streams in the block will align themselves on the first stream of the block
@@ -100,36 +99,23 @@ namespace cuZFP
                     mask &= 0xffffffff << misaligned;
                 if ((i + 1) * 32 > misaligned + length_bits)
                     mask &= ~(0xffffffff << ((misaligned + length_bits) & 31));
-                
+
                 atomicAdd(sm_out + off_smout + i, v1 & mask);
             }
         }
 
-        // First thread working on each bistream writes the length in shared memory
-        // Add zero-padding bits if needed (last bitstream of last chunk)
-        // The extra bits in shared mempory are already zeroed.
-        if (threadIdx.x == 0)
-            sm_length[threadIdx.y] = length_bits + add_padding;
-
-        // This synchthreads protects sm_out and sm_length.
+        // This synchthreads protects sm_out.
         __syncthreads();
 
-        // Compute total length for the threadblock
-        uint total_length = 0;
-        for (int i = tid & 31; i < num_tiles; i += 32)
-            total_length += sm_length[i];
-        for (int i = 1; i < 32; i *= 2)
-            total_length += __shfl_xor_sync(0xffffffff, total_length, i);
-
         // Write the shared memory output data to global memory, using all the threads
-        for (int i = tid; i * 32 < misaligned0 + total_length; i += tile_size * num_tiles)
+        for (int i = tid; i * 32 < misaligned0 + total_length_bits; i += tile_size * num_tiles)
         {
             // Mask out the beginning and end of the block if unaligned
             uint mask = 0xffffffff;
             if (i == 0)
                 mask &= 0xffffffff << misaligned0;
-            if ((i + 1) * 32 > misaligned0 + total_length)
-                mask &= ~(0xffffffff << ((misaligned0 + total_length) & 31));
+            if ((i + 1) * 32 > misaligned0 + total_length_bits)
+                mask &= ~(0xffffffff << ((misaligned0 + total_length_bits) & 31));
             // Reset the shared memory to zero for the next iteration.
             uint value = sm_out[i];
             sm_out[i] = 0;
@@ -169,12 +155,12 @@ namespace cuZFP
                                                 int maxpad32)
     {
         cg::grid_group grid = cg::this_grid();
-        __shared__ uint sm_length[num_tiles];
         extern __shared__ uint sm_in[];              // sm_in[num_tiles * maxpad32]
         uint *sm_out = sm_in + num_tiles * maxpad32; // sm_out[num_tiles * maxpad32 + 2]
         int tid = threadIdx.y * tile_size + threadIdx.x;
         int grid_stride = gridDim.x * num_tiles;
         int first_bitstream_block = blockIdx.x * num_tiles;
+        int first_bitstream_next_block = first_bitstream_block + blockDim.y;
         int my_stream = first_bitstream_block + threadIdx.y;
 
         // Zero the output shared memory. Will be reset again inside process().
@@ -190,9 +176,20 @@ namespace cuZFP
             unsigned long long offset0 = 0;
             unsigned long long offset = 0;
             uint length_bits = 0;
-            uint add_padding = 0;
+            uint total_length_bits = 0;
             if (active_thread_block)
+            {
                 offset0 = offsets[first_bitstream_block + i];
+                int inext = min(first_bitstream_next_block + i, nstreams_chunk);
+                unsigned long long offset1 = offsets[inext];
+                total_length_bits = offset1 - offset0;
+                // Add padding if this block has the last stream of the last chunk
+                if (last_chunk && inext == nstreams_chunk)
+                {
+                    uint partial = offset1 & 63;
+                    total_length_bits += (64 - partial) & 63;
+                }
+            }
 
             if (valid_stream)
             {
@@ -201,11 +198,6 @@ namespace cuZFP
                 unsigned long long next_offset_bits = offsets[my_stream + i + 1];
                 length_bits = (uint)(next_offset_bits - offset);
                 load_to_shared<tile_size>(streams, sm_in, offset_bits, length_bits, maxpad32);
-                if (last_chunk && (my_stream + i == nstreams_chunk - 1))
-                {
-                    uint partial = next_offset_bits & 63;
-                    add_padding = (64 - partial) & 63;
-                }
             }
 
             // Check if there is overlap between input and output at the grid level.
@@ -213,7 +205,7 @@ namespace cuZFP
             // All the threads launched must participate in a grid::sync
             int last_stream = min(nstreams_chunk, i + grid_stride);
             unsigned long long writing_to = (offsets[last_stream] + 31) / 32;
-            unsigned long long reading_from = (first_stream_chunk + i) * maxbits;
+            unsigned long long reading_from = ((first_stream_chunk + i) * maxbits) / 32;
             if (writing_to >= reading_from)
                 grid.sync();
             else
@@ -221,8 +213,8 @@ namespace cuZFP
 
             // Compact the shared memory data of the whole thread block and write it to global memory
             if (active_thread_block)
-                process<tile_size, num_tiles>(valid_stream, offset0, offset, length_bits, add_padding,
-                                            tid, sm_in, sm_out, maxpad32, sm_length, streams);
+                process<tile_size, num_tiles>(valid_stream, offset0, offset, length_bits, total_length_bits,
+                                              tid, sm_in, sm_out, maxpad32, streams);
         }
 
         // Reset the base of the offsets array, for the next chunk's prefix sum
@@ -263,7 +255,7 @@ namespace cuZFP
                                                           concat_bitstreams_chunk<tile_size, num_tiles>,
                                                           tile_size * num_tiles, shmem);
             max_blocks *= num_sm;
-            max_blocks = min(nstream_chunk, max_blocks);
+            max_blocks = min((nstream_chunk + num_tiles - 1) / num_tiles, max_blocks);
             dim3 threads(tile_size, num_tiles, 1);
             cudaLaunchCooperativeKernel((void *)concat_bitstreams_chunk<tile_size, num_tiles>,
                                         dim3(max_blocks, 1, 1), threads, kernelArgs, shmem, 0);
@@ -277,7 +269,7 @@ namespace cuZFP
                                                           concat_bitstreams_chunk<tile_size, num_tiles>,
                                                           tile_size * num_tiles, shmem);
             max_blocks *= num_sm;
-            max_blocks = min(nstream_chunk, max_blocks);
+            max_blocks = min((nstream_chunk + num_tiles - 1) / num_tiles, max_blocks);
             dim3 threads(tile_size, num_tiles, 1);
             cudaLaunchCooperativeKernel((void *)concat_bitstreams_chunk<tile_size, num_tiles>,
                                         dim3(max_blocks, 1, 1), threads, kernelArgs, shmem, 0);
@@ -291,7 +283,7 @@ namespace cuZFP
                                                           concat_bitstreams_chunk<tile_size, num_tiles>,
                                                           tile_size * num_tiles, shmem);
             max_blocks *= num_sm;
-            max_blocks = min(nstream_chunk, max_blocks);
+            max_blocks = min((nstream_chunk + num_tiles - 1) / num_tiles, max_blocks);
             dim3 threads(tile_size, num_tiles, 1);
             cudaLaunchCooperativeKernel((void *)concat_bitstreams_chunk<tile_size, num_tiles>,
                                         dim3(max_blocks, 1, 1), threads, kernelArgs, shmem, 0);
@@ -305,7 +297,7 @@ namespace cuZFP
                                                           concat_bitstreams_chunk<tile_size, num_tiles>,
                                                           tile_size * num_tiles, shmem);
             max_blocks *= num_sm;
-            max_blocks = min(nstream_chunk, max_blocks);
+            max_blocks = min((nstream_chunk + num_tiles - 1) / num_tiles, max_blocks);
             dim3 threads(tile_size, num_tiles, 1);
             cudaLaunchCooperativeKernel((void *)concat_bitstreams_chunk<tile_size, num_tiles>,
                                         dim3(max_blocks, 1, 1), threads, kernelArgs, shmem, 0);
